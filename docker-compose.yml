@@ -1,0 +1,242 @@
+version: "3.10"
+
+services:
+  zookeeper:
+    image: docker.io/confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    logging:
+      driver: none  # Completely disable logging
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - timeseries-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: docker.io/confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    logging:
+      driver: none  # Completely disable logging
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # Merge: ensure the broker actually listens on both ports
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:9094
+      # Keep: internal DNS name for containers + localhost for host access
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_NUM_PARTITIONS: 3
+    networks:
+      - timeseries-network
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: timescaledb
+    environment:
+      POSTGRES_USER: tsuser
+      POSTGRES_PASSWORD: ts_password
+      POSTGRES_DB: timeseries
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./k8s/timescaledb-init:/docker-entrypoint-initdb.d
+    networks:
+      - timeseries-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tsuser -d timeseries"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  preprocessing:
+    build:
+      context: ../preprocessing-service
+      dockerfile: Dockerfile
+    container_name: preprocessing
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://tsuser:ts_password@timescaledb:5432/timeseries
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_INPUT_TOPIC: data.ingestion.completed
+      KAFKA_OUTPUT_TOPIC: data.preprocessing.completed
+      KAFKA_ERR_TOPIC: messages.failure
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../preprocessing-service/preprocessing-service/src:/app/src:ro
+      - ./shared:/app/shared:ro
+    networks:
+      - timeseries-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3.11", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  forecasting:
+    build:
+      context: ../forecasting_service
+      dockerfile: Dockerfile
+    container_name: forecasting
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      preprocessing:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://tsuser:ts_password@timescaledb:5432/timeseries
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_INPUT_TOPIC: data.preprocessing.completed
+      KAFKA_OUTPUT_TOPIC: data.forecast.completed
+      KAFKA_ERR_TOPIC: messages.failure
+      PREPROCESSING_SERVICE_URL: http://preprocessing:8000
+      PYTHONUNBUFFERED: 1
+      PYTHONPATH: /app
+    ports:
+      - "8001:8001"
+    volumes:
+      - forecasting-models:/app/models
+      - ./shared:/app/shared:ro
+    networks:
+      - timeseries-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  dashboard:
+    build:
+      context: ../dashboard-service
+      dockerfile: Dockerfile
+    container_name: dashboard
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      preprocessing:
+        condition: service_healthy
+      forecasting:
+        condition: service_healthy
+    environment:
+      DATABASE_HOST: timescaledb
+      DATABASE_PORT: 5432
+      DATABASE_NAME: timeseries
+      DATABASE_USER: tsuser
+      DATABASE_PASSWORD: ts_password
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PREPROCESSING_SERVICE_URL: http://preprocessing:8000
+      FORECASTING_SERVICE_URL: http://forecasting:8001
+      PYTHONUNBUFFERED: 1
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: false
+      PYTHONPATH: /app:/shared
+    ports:
+      - "8501:8501"
+    volumes:
+      - ../dashboard-service:/app:ro
+      - ./shared:/app/shared:ro
+    networks:
+      - timeseries-network
+    restart: unless-stopped
+
+  kafka-ui:
+    image: docker.io/provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - timeseries-network
+
+  # Added from the other compose:
+  anomaly_service:
+    build:
+      context: ../time_series_project/anomaly_service
+    container_name: anomaly_service
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://tsuser:ts_password@timescaledb:5432/timeseries
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: data.anomaly_detection.completed
+      KAFKA_GROUP_ID: anomaly-service-group
+    ports:
+      - "8002:8001"
+    networks:
+      - timeseries-network
+    restart: unless-stopped
+    volumes:
+      - ./shared:/app/shared:ro
+
+  # Added from the other compose:
+  stats_service:
+    build:
+      context: ../time_series_project/stats_service
+    container_name: stats_service
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://tsuser:ts_password@timescaledb:5432/timeseries
+    ports:
+      - "8003:8002"
+    networks:
+      - timeseries-network
+    restart: unless-stopped
+    volumes:
+      - ./shared:/app/shared:ro
+
+networks:
+  timeseries-network:
+    driver: bridge
+
+volumes:
+  timescaledb-data:
+  forecasting-models:
