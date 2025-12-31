@@ -74,6 +74,27 @@ services:
       timeout: 5s
       retries: 5
 
+  postgres-pipeline:
+    image: docker.io/postgres:15-alpine  # Lightweight PostgreSQL
+    container_name: postgres-pipeline
+    environment:
+      POSTGRES_USER: tsuser
+      POSTGRES_PASSWORD: ts_password
+      POSTGRES_DB: pipeline
+    ports:
+      - "5433:5432"  # External port 5433 to avoid conflict with main DB
+    volumes:
+      - postgres-pipeline-data:/var/lib/postgresql/data
+      - ./k8s/postgres/pipeline:/docker-entrypoint-initdb.d
+    networks:
+      - timeseries-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tsuser -d pipeline"]  # Fixed DB name
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   preprocessing:
     build:
       context: ../preprocessing-service
@@ -82,15 +103,23 @@ services:
     depends_on:
       timescaledb:
         condition: service_healthy
+      postgres-pipeline:
+        condition: service_healthy
       kafka:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+psycopg2://tsuser:ts_password@timescaledb:5432/timeseries
+      PIPELINE_DATABASE_HOST: postgres-pipeline
+      PIPELINE_DATABASE_PORT: 5432
+      PIPELINE_DATABASE_NAME: pipeline
+      PIPELINE_DATABASE_USER: tsuser
+      PIPELINE_DATABASE_PASSWORD: ts_password
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_INPUT_TOPIC: data.ingestion.completed
       KAFKA_OUTPUT_TOPIC: data.preprocessing.completed
       KAFKA_ERR_TOPIC: messages.failure
       PYTHONUNBUFFERED: 1
+      PYTHONPATH: /app/src:/app
     ports:
       - "8000:8000"
     volumes:
@@ -240,3 +269,4 @@ networks:
 volumes:
   timescaledb-data:
   forecasting-models:
+  postgres-pipeline-data:
