@@ -135,7 +135,8 @@ services:
       - "8009:8009"         
     volumes:
       - ../ingestion/ingestion:/app          # ← Mount entire folder as /app
-      - ingestion-data:/app/data                      # NEW: Persistent data
+      - ingestion-data:/app/data  
+      - ./shared:/app/shared                    
     networks:
       - timeseries-network
     restart: unless-stopped
